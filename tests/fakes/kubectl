@@ -2,11 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Stand-in for kubectl in the tests. It keeps one Lease in $FAKE_K8S/lease.json
 # and behaves like the API server: create fails when the Lease exists, replace
-# fails when resourceVersion is stale. FAKE_K8S_BUMP_AFTER_GET=1 makes another
-# writer change the Lease right after each get, to test a lost race.
+# fails when resourceVersion is stale, and a delete with preconditions fails
+# when the uid or resourceVersion no longer match.
+#   FAKE_K8S_BUMP_AFTER_GET=1  another writer changes the Lease right after each get
+#   FAKE_K8S_DOWN=1            every call fails like an unreachable cluster
+# Every call is logged in $FAKE_K8S/calls.log.
 set -euo pipefail
 
+echo "$*" >>"$FAKE_K8S/calls.log"
 store="$FAKE_K8S/lease.json"
+if [ "${FAKE_K8S_DOWN:-0}" = 1 ]; then
+  echo "Unable to connect to the server: dial tcp: connection refused" >&2
+  exit 1
+fi
 if [ "$1" = -n ]; then
   shift 2
 fi
@@ -14,7 +22,7 @@ verb="$1"
 case "$verb" in
   get)
     [ -f "$store" ] || {
-      echo "Error from server (NotFound)" >&2
+      echo "Error from server (NotFound): leases not found" >&2
       exit 1
     }
     cat "$store"
@@ -28,7 +36,7 @@ case "$verb" in
       echo "Error from server (AlreadyExists)" >&2
       exit 1
     }
-    jq '.metadata.resourceVersion = "1"' >"$store"
+    jq '.metadata.resourceVersion = "1" | .metadata.uid = "uid-1"' >"$store"
     ;;
   replace)
     [ -f "$store" ] || exit 1
@@ -38,9 +46,23 @@ case "$verb" in
       echo "Error from server (Conflict)" >&2
       exit 1
     }
-    jq --arg v "$((current + 1))" '.metadata.resourceVersion = $v' <<<"$incoming" >"$store"
+    jq --arg v "$((current + 1))" --arg uid "$(jq -r '.metadata.uid' "$store")" \
+      '.metadata.resourceVersion = $v | .metadata.uid = $uid' <<<"$incoming" >"$store"
     ;;
   delete)
+    if [ "${2:-}" = --raw ]; then
+      options="$(cat)"
+      [ -f "$store" ] || exit 1
+      [ "$(jq -r '.preconditions.resourceVersion // ""' <<<"$options")" = "$(jq -r '.metadata.resourceVersion' "$store")" ] || {
+        echo "Error from server (Conflict): the resourceVersion precondition failed" >&2
+        exit 1
+      }
+      want_uid="$(jq -r '.preconditions.uid // ""' <<<"$options")"
+      [ -z "$want_uid" ] || [ "$want_uid" = "$(jq -r '.metadata.uid' "$store")" ] || {
+        echo "Error from server (Conflict): the uid precondition failed" >&2
+        exit 1
+      }
+    fi
     rm -f "$store"
     ;;
   *)

@@ -10,9 +10,13 @@
 #   e2e run <scenario> -- <command> [args]
 #
 # "run" is the whole sequence:
-#   lease, preflight, run tag and SSH key, the scenario command under a hard
-#   time limit, then on failure: logs first, then teardown (or a hold when
+#   check every input, take the Lease, preflight, run tag and SSH key, the
+#   scenario command under a hard time limit while a loop renews the Lease,
+#   then on failure: logs first, then teardown (or a hold when
 #   E2E_KEEP_ON_FAILURE=1), then the check that nothing tagged remains.
+# INT, TERM and any early exit still tear down and give the Lease back.
+# Exit codes: 0 pass, 1 refused or leftovers, 2 bad input, 3 the Lease is held,
+# 4 the cluster is unreachable, anything else is the scenario's own status.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +30,85 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$here/lib/issue.sh"
 
 readonly E2E_RUN_LIMIT_MAX=5400
+readonly E2E_CAPTURE_LIMIT_MAX=600
+readonly E2E_TEARDOWN_LIMIT_MAX=1800
+
+# State for the cleanup trap. These are globals on purpose.
+run_phase=pre # pre, scenario, finished
+run_lease=0
+run_keep_lease=0
+run_keep_key=0
+run_cancelled=0
+run_status=0
+run_renew_pid=""
+run_scenario_pid=""
+
+# e2e_limit <variable> <default> <max>: a whole number from 1 to max.
+e2e_limit() {
+  local value="${!1:-$2}"
+  [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le "$3" ] ||
+    e2e_usage_die "$1 must be 1 to $3"
+  echo "$value"
+}
+
+# The sleep runs in the background so that a TERM from e2e_stop_renew kills it
+# too. A sleep left behind would hold the output of the run open.
+e2e_renew_loop() {
+  local sleeper=""
+  trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; exit 0' TERM
+  while :; do
+    sleep "$1" &
+    sleeper=$!
+    wait "$sleeper" || true
+    e2e_lease_renew || {
+      echo "run: could not renew the Lease" >&2
+      break
+    }
+  done
+}
+
+e2e_stop_renew() {
+  if [ -n "$run_renew_pid" ]; then
+    kill "$run_renew_pid" 2>/dev/null || true
+    wait "$run_renew_pid" 2>/dev/null || true
+    run_renew_pid=""
+  fi
+}
+
+# Teardown hook, then the check that nothing tagged remains. Leftovers mark the
+# Lease so that the next run cannot start beside them, and fail the run.
+e2e_teardown_phase() {
+  run_phase=finished
+  if [ -n "${E2E_TEARDOWN_HOOK:-}" ]; then
+    timeout --kill-after=30 "$teardown_limit" "$E2E_TEARDOWN_HOOK" || {
+      echo "run: the teardown hook failed or ran out of time" >&2
+      [ "$run_status" -ne 0 ] || run_status=1
+    }
+  fi
+  if ! e2e_verify_clean "$E2E_RUN_ID"; then
+    e2e_lease_mark_leftovers || echo "run: could not mark the Lease with the leftovers" >&2
+    run_keep_lease=1
+    [ "$run_status" -ne 0 ] || run_status=1
+  fi
+}
+
+# Runs on every exit. An early exit while the scenario ran still tears down.
+e2e_exit_cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  e2e_stop_renew
+  if [ "$run_phase" = scenario ]; then
+    echo "run: stopped early, tearing down" >&2
+    run_status="$rc"
+    e2e_teardown_phase || true
+    [ "$run_status" -eq 0 ] || rc="$run_status"
+  fi
+  [ "$run_keep_key" = 1 ] || e2e_sshkey_delete "${E2E_RUN_ID:-none}" 2>/dev/null || true
+  if [ "$run_lease" = 1 ] && [ "$run_keep_lease" = 0 ]; then
+    e2e_lease_release || true
+  fi
+  exit "$rc"
+}
 
 e2e_run() {
   local scenario="${1:-}"
@@ -34,60 +117,78 @@ e2e_run() {
   [ "${1:-}" = "--" ] || e2e_usage_die "usage: e2e run <scenario> -- <command>"
   shift
   [ "$#" -gt 0 ] || e2e_usage_die "no scenario command given"
-  e2e_require_env E2E_LOG_DIR E2E_TOKEN
-  local limit="${E2E_RUN_LIMIT_SECONDS:-$E2E_RUN_LIMIT_MAX}"
-  [[ "$limit" =~ ^[0-9]+$ ]] && [ "$limit" -ge 1 ] && [ "$limit" -le "$E2E_RUN_LIMIT_MAX" ] ||
-    e2e_usage_die "E2E_RUN_LIMIT_SECONDS must be 1 to $E2E_RUN_LIMIT_MAX"
+  # Every input is checked before the Lease is taken.
+  e2e_require_env E2E_LOG_DIR E2E_TOKEN E2E_LEASE_NAME E2E_LEASE_NAMESPACE
+  e2e_preflight_inputs
+  local limit renew_every
+  limit="$(e2e_limit E2E_RUN_LIMIT_SECONDS "$E2E_RUN_LIMIT_MAX" "$E2E_RUN_LIMIT_MAX")"
+  capture_limit="$(e2e_limit E2E_CAPTURE_LIMIT_SECONDS "$E2E_CAPTURE_LIMIT_MAX" "$E2E_CAPTURE_LIMIT_MAX")"
+  teardown_limit="$(e2e_limit E2E_TEARDOWN_LIMIT_SECONDS "$E2E_TEARDOWN_LIMIT_MAX" "$E2E_TEARDOWN_LIMIT_MAX")"
+  renew_every="$(e2e_limit E2E_RENEW_INTERVAL_SECONDS 600 3600)"
 
   E2E_RUN_ID="$(e2e_new_run_id)"
   E2E_HOLDER="$E2E_RUN_ID"
   export E2E_RUN_ID E2E_HOLDER
   echo "run: $E2E_RUN_ID"
 
-  e2e_lease_acquire || return 3
-  if ! e2e_preflight; then
-    e2e_lease_release || true
-    return 1
-  fi
+  trap e2e_exit_cleanup EXIT
+  # A signal stops the scenario and the run still tears down. Before the
+  # scenario starts there is nothing to tear down, so the run just exits.
+  trap 'run_cancelled=1
+    if [ -n "$run_scenario_pid" ]; then kill -TERM "$run_scenario_pid" 2>/dev/null || true
+    elif [ "$run_phase" = pre ]; then exit 143; fi' INT TERM
+
+  local acquired=0
+  e2e_lease_acquire || acquired=$?
+  case "$acquired" in
+    0) run_lease=1 ;;
+    4) return 4 ;;
+    *) return 3 ;;
+  esac
+  # A failed API read inside the preflight exits the script. The exit trap
+  # gives the Lease back.
+  e2e_preflight || return 1
 
   E2E_KEY_DIR="$(e2e_sshkey_create "$E2E_RUN_ID")"
   export E2E_KEY_DIR
   mkdir -p "$E2E_LOG_DIR"
 
-  local status=0
-  timeout --kill-after=60 "$limit" "$@" || status=$?
-  [ "$status" -ne 124 ] || echo "run: hit the $limit second limit" >&2
+  e2e_renew_loop "$renew_every" &
+  run_renew_pid=$!
 
-  if [ "$status" -ne 0 ] && [ -n "${E2E_CAPTURE_HOOK:-}" ]; then
+  run_phase=scenario
+  timeout --kill-after=60 "$limit" "$@" &
+  run_scenario_pid=$!
+  while :; do
+    run_status=0
+    wait "$run_scenario_pid" || run_status=$?
+    kill -0 "$run_scenario_pid" 2>/dev/null || break
+  done
+  run_scenario_pid=""
+  [ "$run_status" -ne 124 ] || echo "run: hit the $limit second limit" >&2
+  [ "$run_cancelled" -eq 0 ] || echo "run: cancelled" >&2
+
+  if [ "$run_status" -ne 0 ] && [ -n "${E2E_CAPTURE_HOOK:-}" ]; then
     echo "run: capturing logs first"
-    "$E2E_CAPTURE_HOOK" "$E2E_LOG_DIR" || echo "run: the log capture hook failed" >&2
+    timeout --kill-after=30 "$capture_limit" "$E2E_CAPTURE_HOOK" "$E2E_LOG_DIR" ||
+      echo "run: the log capture hook failed or ran out of time" >&2
   fi
 
-  local held=0
-  if [ "$status" -ne 0 ] && [ "${E2E_KEEP_ON_FAILURE:-0}" = 1 ]; then
-    e2e_hold "$E2E_RUN_ID" "$E2E_HOLD_MAX" && held=1
+  if [ "$run_status" -ne 0 ] && [ "$run_cancelled" -eq 0 ] && [ "${E2E_KEEP_ON_FAILURE:-0}" = 1 ]; then
+    run_phase=finished
+    e2e_stop_renew
+    run_keep_lease=1
+    run_keep_key=1
+    e2e_hold "$E2E_RUN_ID" "$E2E_HOLD_MAX" || echo "run: the hold is incomplete, see above" >&2
     echo "run: held for debugging, no teardown. The SSH key stays in $E2E_KEY_DIR"
   else
-    if [ -n "${E2E_TEARDOWN_HOOK:-}" ]; then
-      "$E2E_TEARDOWN_HOOK" || {
-        echo "run: the teardown hook failed" >&2
-        [ "$status" -ne 0 ] || status=1
-      }
-    fi
-    if ! e2e_verify_clean "$E2E_RUN_ID"; then
-      # Leftovers keep the Lease, so the next run cannot start beside them.
-      # The janitor deletes the guests and then releases the stale Lease.
-      held=1
-      [ "$status" -ne 0 ] || status=1
-    fi
-    e2e_sshkey_delete "$E2E_RUN_ID"
+    e2e_teardown_phase
   fi
 
-  [ "$held" = 1 ] || e2e_lease_release || true
-  if [ "$status" -ne 0 ] && [ -n "${E2E_ISSUE_REPO:-}" ]; then
+  if [ "$run_status" -ne 0 ] && [ -n "${E2E_ISSUE_REPO:-}" ]; then
     e2e_failure_issue "$scenario" "$E2E_RUN_ID" "${E2E_RUN_URL:-}" || echo "run: could not file the failure issue" >&2
   fi
-  return "$status"
+  return "$run_status"
 }
 
 main() {

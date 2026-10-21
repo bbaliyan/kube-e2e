@@ -83,3 +83,25 @@ ok "status reports the holder or free"
 
 expect_status "a missing holder stops the run" 2 env -u E2E_HOLDER "$e2e" lease acquire
 ok "a missing input stops the run"
+
+# --- Added after review ---
+
+rm -f "$work/k8s/lease.json"
+expect_status "an unreachable cluster is not a held Lease" 4 env FAKE_K8S_DOWN=1 E2E_HOLDER=run-a "$e2e" lease acquire
+grep -q 'cannot reach the cluster' <<<"$out" || fail "the message says the cluster is unreachable" "$out"
+ok "acquire answers exit 4 when the cluster is unreachable"
+
+rm -f "$work/k8s/lease.json"
+as run-a 0 acquire >/dev/null
+expect_status "release survives a change after the read" 1 env FAKE_K8S_BUMP_AFTER_GET=1 E2E_HOLDER=run-a E2E_NOW=$((t0 + 10)) "$e2e" lease release
+[ -f "$work/k8s/lease.json" ] || fail "a Lease that changed after the read is not deleted"
+grep -q 'changed since it was read' <<<"$out" || fail "the message says why" "$out"
+ok "release deletes only the Lease it read, so a newer Lease stays"
+
+# The time comes from jq, not from GNU date -d. This date fails like BSD date.
+mkdir -p "$work/bsd"
+printf '#!/usr/bin/env bash\nfor arg; do [ "$arg" != -d ] || exit 1; done\nexec /usr/bin/date "$@"\n' >"$work/bsd/date"
+chmod +x "$work/bsd/date"
+run_status env PATH="$work/bsd:$PATH" bash -c ". '$root/lib/lease.sh'; e2e_lease_iso 1700000000"
+[ "$out" = "2023-11-14T22:13:20.000000Z" ] || fail "the Lease time is formatted without GNU date" "$out"
+ok "the Lease time does not depend on GNU date"

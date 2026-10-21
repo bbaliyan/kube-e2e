@@ -44,6 +44,13 @@ path="${url#"$E2E_API_URL"}"
 echo "$method $path ${data[*]:-}" >>"$FAKE_API/requests.log"
 sed -n 's/^header = "Authorization: PVEAPIToken=\(.*\)"$/\1/p' <<<"$config" >>"$FAKE_API/tokens.log"
 
+# FAKE_API_FAIL_PUT lists vmids (separated by spaces) whose tag update fails.
+if [ "$method" = PUT ]; then
+  for failing in ${FAKE_API_FAIL_PUT:-}; do
+    [[ "$path" != */qemu/$failing/config ]] || exit 22
+  done
+fi
+
 file="$FAKE_API/$(tr '/?=&' '____' <<<"$path").json"
 if [ -f "$file" ]; then
   cat "$file"

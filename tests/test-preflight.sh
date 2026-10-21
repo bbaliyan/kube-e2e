@@ -37,14 +37,37 @@ expect_status "provisioned disk over 90 percent" 1 env E2E_CAP_DISK_BYTES=$((100
 grep -q 'provisioned disk bytes (90%).*FAIL' <<<"$out" || fail "the pool ceiling row fails" "$out"
 ok "the 90 percent provisioned disk ceiling is enforced in bytes"
 
-guests "$(guest 100 running $((20 * GIB)) 4 home '')" \
-  "$(guest 9001 running $((8 * GIB)) 4 e2e 'kube-e2e;e2e-1-aaa;created-1')" \
-  "$(guest 9002 running $((8 * GIB)) 4 e2e 'kube-e2e;e2e-1-aaa;created-1')" \
-  "$(guest 9500 running $((8 * GIB)) 4 e2e '')" \
-  "$(guest 9003 running $((8 * GIB)) 4 home '')"
-expect_status "existing e2e guests count" 1 env E2E_REQ_VMS=3 "$e2e" preflight
-grep -q 'e2e guests (cap).*need=5 ' <<<"$out" || fail "two existing guests plus three requested make five" "$out"
-ok "existing e2e guests count, and guests outside the pool or the VMID range do not"
+guests "$(guest 100 running $((20 * GIB)) 4 home '')" "$(guest 9001 running $((8 * GIB)) 4 e2e 'kube-e2e;e2e-1-aaa;created-1')" "$(guest 9002 running $((8 * GIB)) 4 e2e 'kube-e2e;e2e-1-aaa;created-1')" "$(guest 9500 running $((8 * GIB)) 4 e2e '')" "$(guest 9003 running $((8 * GIB)) 4 home '')" "$(guest 8000 running $((8 * GIB)) 4 home '')"
+expect_status "existing e2e guests count" 1 env E2E_REQ_VMS=1 "$e2e" preflight
+grep -q 'e2e guests (cap).*need=5 ' <<<"$out" || fail "the pool and the VMID range are joined: four existing plus one requested" "$out"
+ok "a guest counts when it is in the pool or in the VMID range, and a guest in neither does not"
+
+baseline
+guests "$(guest 100 running $((20 * GIB)) 4 home '')" "$(guest 101 running $((40 * GIB)) 4 home '' 0 node2)"
+expect_status "guests on another node are not committed here" 0 "$e2e" preflight
+ok "committed RAM counts only the running guests of the node"
+
+baseline
+expect_status "a bad VMID range" 2 env E2E_VMID_MIN=9100 E2E_VMID_MAX=9000 "$e2e" preflight
+ok "a VMID range with the minimum above the maximum stops the run"
+
+baseline
+expect_status "an unverified disk rule fails closed" 1 env -u E2E_DISK_RULE_VERIFIED "$e2e" preflight
+grep -q 'NOT VERIFIED' <<<"$out" || fail "the message says the disk rule is not verified" "$out"
+ok "the disk rule fails closed until the owner has compared it with lvs"
+
+# 300 GiB of volumes, but the pool really holds 950 GiB: the larger number counts.
+fixture /nodes/node1/storage/thin1/status "{\"data\":{\"total\":$((1000 * GIB)),\"used\":$((950 * GIB))}}"
+expect_status "real pool usage above the volume sizes" 1 "$e2e" preflight
+grep -q 'provisioned disk bytes (90%).*FAIL' <<<"$out" || fail "the pool usage is used when it is larger" "$out"
+ok "real pool usage counts when it is larger than the volume sizes, so missed snapshots cannot hide"
+
+baseline
+guests "$(guest 100 running $((20 * GIB)) 4 home '')" "$(guest 9500 stopped $((1 * GIB)) 1 e2e '')"
+volumes "100:$((300 * GIB))" "9500:$((150 * GIB))"
+expect_status "disk of a pool guest outside the range" 1 "$e2e" preflight
+grep -q 'e2e disk bytes (cap).*need=268435456000 ' <<<"$out" || fail "the disk of a pool guest counts" "$out"
+ok "the disk of a pool guest outside the VMID range counts"
 
 baseline
 for name in E2E_CAP_VMS E2E_CAP_VCPU E2E_CAP_RAM_BYTES E2E_CAP_DISK_BYTES E2E_REQ_VMS E2E_VMID_MIN E2E_POOL E2E_AUDIT_TOKEN; do

@@ -11,19 +11,26 @@ commit SHA.
 
 `bin/e2e run <scenario> -- <command>` runs one scenario in this order:
 
-1. Take the Lease. If another run holds it, stop with exit 3.
-2. Run the preflight. If the request is over a cap, stop with exit 1.
-3. Make a run id and a one-time SSH key.
-4. Run the scenario command with a hard limit of 90 minutes.
-5. If the scenario failed, capture logs first.
-6. If `E2E_KEEP_ON_FAILURE=1` and the scenario failed, hold the guests for 2 hours. Skip the teardown.
-7. Otherwise run the teardown hook and verify that no guest with the run tag remains.
-8. Delete the SSH key and release the Lease.
-9. If the scenario failed and `E2E_ISSUE_REPO` is set, open or update one failure issue.
+1. Check every input. A missing or bad input stops the run with exit 2, before any Lease is taken.
+2. Take the Lease. If another run holds it, stop with exit 3. If the cluster cannot be reached, stop with exit 4.
+3. Run the preflight. If the request is over a cap, stop with exit 1.
+4. Make a run id and a one-time SSH key.
+5. Run the scenario command with a hard limit of 90 minutes. A loop renews the Lease every 10 minutes meanwhile.
+6. If the scenario failed, capture logs first. The hook has at most 10 minutes.
+7. If `E2E_KEEP_ON_FAILURE=1` and the scenario failed, hold the guests for 2 hours. Skip the teardown.
+8. Otherwise run the teardown hook (at most 30 minutes) and verify that no guest with the run tag remains.
+9. Delete the SSH key and release the Lease.
+10. If the scenario failed and `E2E_ISSUE_REPO` is set, open or update one failure issue.
 
-If a guest with the run tag remains after teardown, the run fails and keeps the
-Lease. The next run cannot start beside the leftovers. The janitor deletes the
-guests, then releases the stale Lease.
+INT and TERM stop the scenario, and the run still tears down. Any early exit
+tears down, deletes the key and releases the Lease.
+
+If a guest with the run tag remains after teardown, the run fails and marks the
+Lease as `leftovers` with a hold far in the future. No later run can take it.
+The janitor deletes the guests, then runs `bin/e2e lease release-stale`. That
+call deletes a leftovers Lease only when the guests of the run are gone. It
+deletes with uid and resourceVersion preconditions, so it never deletes a
+newer Lease.
 
 ## Commands
 
@@ -60,6 +67,9 @@ with exit 2. There are no defaults for caps or addresses.
 | `E2E_TEARDOWN_HOOK` | Optional. Program that destroys the guests |
 | `E2E_KEEP_ON_FAILURE` | Optional. `1` holds a failed run for 2 hours |
 | `E2E_RUN_LIMIT_SECONDS` | Optional. Hard limit, at most 5400 |
+| `E2E_CAPTURE_LIMIT_SECONDS`, `E2E_TEARDOWN_LIMIT_SECONDS` | Optional. Limits of the hooks, at most 600 and 1800 |
+| `E2E_RENEW_INTERVAL_SECONDS` | Optional. Lease renewal every so many seconds, at most 3600. Default 600 |
+| `E2E_DISK_RULE_VERIFIED` | Set to `1` after you compared the disk numbers with `lvs`. See the rules |
 | `E2E_KEY_ROOT` | Optional. Parent directory of the one-time SSH key. Default `TMPDIR` |
 | `E2E_ISSUE_REPO`, `E2E_ISSUE_TOKEN` | Optional. Spoke that owns the scenario, and an issue-only token |
 | `E2E_RUN_URL` | Optional. Link to the run, put in the failure issue |
@@ -70,9 +80,11 @@ guest with the tags from `lib/tags.sh`: `kube-e2e`, the run id and
 
 ## The rules
 
+- A guest is an e2e guest when it is in the pool or its VMID is in the reserved range.
 - The e2e guests, existing and requested, stay within the four caps.
-- RAM committed by all running guests, plus the request, stays within 75% of the host RAM.
-- Provisioned disk of every volume on the storage, plus the request, stays within 90% of the storage size. Sizes are in bytes from the API.
+- RAM committed by the running guests of the node, plus the request, stays within 75% of the host RAM.
+- Provisioned disk, plus the request, stays within 90% of the storage size. Sizes are in bytes from the API. Provisioned is the larger of the sum of volume sizes and the real pool usage, because the content list may miss thin snapshots.
+- **The disk rule fails closed.** Until `E2E_DISK_RULE_VERIFIED=1`, every preflight is refused. Compare the numbers the preflight prints with `lvs` on the host, including snapshots, then set the variable.
 - One Lease serialises runs from GitHub and GitLab. It expires 2 hours after the last renewal. A hold renews it.
 - A run takes at most 90 minutes. A hold takes at most 2 hours.
 
@@ -80,6 +92,13 @@ guest with the tags from `lib/tags.sh`: `kube-e2e`, the run id and
 
 Every guest carries `kube-e2e;<run id>;created-<epoch>`. A held guest also
 carries `hold-until-<epoch>`. The janitor reads the same tags.
+
+## Cautions
+
+- Never run these scripts with `set -x` or `bash -x`. The tokens are in the environment, and a trace prints them.
+- The failure issue is deduplicated by a search on the title. GitHub's search index can lag by a minute or more, so two failures close together can open two issues. Close the extra by hand.
+- `e2e lease release-stale` needs `kubectl delete --raw` with a body on standard input. Verify it against your cluster once.
+- The Lease time uses `jq`, so no GNU `date` is needed. The scripts still expect `bash` 4.4 or newer, `curl`, `jq`, `kubectl` and `timeout`.
 
 ## Tests
 

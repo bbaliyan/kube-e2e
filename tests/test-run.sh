@@ -20,11 +20,13 @@ EOF
 cat >"$work/bin/capture" <<'EOF'
 #!/usr/bin/env bash
 echo "capture $1" >>"$ORDER"
+[ -z "${HANG_CAPTURE:-}" ] || exec sleep 30
 EOF
 # The teardown hook "destroys" the guests unless LEAVE_GUESTS=1.
 cat >"$work/bin/teardown" <<'EOF'
 #!/usr/bin/env bash
 echo teardown >>"$ORDER"
+[ -z "${HANG_TEARDOWN:-}" ] || exec sleep 30
 [ "${LEAVE_GUESTS:-0}" = 1 ] || echo '{"data":[]}' >"$GUEST_FILE"
 EOF
 chmod +x "$work/bin/"*
@@ -38,6 +40,8 @@ fresh() {
   mkdir -p "$work/keys"
   : >"$FAKE_GH/calls.log"
   : >"$FAKE_API/requests.log"
+  : >"$FAKE_K8S/calls.log"
+  unset FAKE_K8S_DOWN E2E_RENEW_INTERVAL_SECONDS E2E_TEARDOWN_LIMIT_SECONDS E2E_CAPTURE_LIMIT_SECONDS HANG_TEARDOWN HANG_CAPTURE FAKE_API_FAIL_PUT
   unset SCENARIO_EXIT SCENARIO_SLEEP LEAVE_GUESTS E2E_KEEP_ON_FAILURE E2E_ISSUE_REPO E2E_ISSUE_TOKEN E2E_RUN_LIMIT_SECONDS || true
 }
 lease_free() { [ ! -f "$work/k8s/lease.json" ]; }
@@ -115,3 +119,82 @@ expect_status "a missing log directory" 2 env -u E2E_LOG_DIR "$e2e" run s1-image
 expect_status "no command" 2 "$e2e" run s1-image-bake --
 expect_status "no scenario name" 2 "$e2e" run
 ok "a missing input stops the run"
+
+# --- Added after review ---
+
+fresh
+export E2E_RENEW_INTERVAL_SECONDS=1 SCENARIO_SLEEP=3
+expect_status "a run longer than the renew interval" 0 "$e2e" run s1-image-bake -- "$work/bin/scenario"
+renews="$(grep -c ' replace ' "$FAKE_K8S/calls.log" || true)"
+[ "$renews" -ge 2 ] || fail "the Lease is renewed while the scenario runs (replace calls: $renews)" "$(cat "$FAKE_K8S/calls.log")"
+lease_free || fail "the Lease is released at the end"
+ok "the Lease is renewed while the scenario runs"
+
+fresh
+export SCENARIO_EXIT=7 HANG_CAPTURE=1 E2E_CAPTURE_LIMIT_SECONDS=1
+run_status timeout 25 "$e2e" run s1-image-bake -- "$work/bin/scenario"
+[ "$status" -eq 7 ] || fail "a hung capture hook is cut off and the scenario status is kept (got $status)" "$out"
+grep -q teardown "$order" || fail "teardown still runs after a hung capture hook"
+ok "a hung log capture hook is cut off and does not block teardown"
+
+fresh
+export HANG_TEARDOWN=1 E2E_TEARDOWN_LIMIT_SECONDS=1
+run_status timeout 25 "$e2e" run s1-image-bake -- "$work/bin/scenario"
+[ "$status" -eq 1 ] || fail "a hung teardown hook is cut off and the run fails (got $status)" "$out"
+grep -q 'guests with run tag' <<<"$out" || fail "the leftovers are still checked after a hung hook" "$out"
+ok "a hung teardown hook is cut off, the leftovers check still runs"
+
+fresh
+export SCENARIO_EXIT=7 LEAVE_GUESTS=1
+"$e2e" run s1-image-bake -- "$work/bin/scenario" >/dev/null 2>&1 || true
+expect_status "the leftovers Lease is far in the future" 0 "$e2e" lease status
+grep -q 'leftovers true' <<<"$out" || fail "the Lease is marked with the leftovers" "$out"
+expect_status "a later run is still refused" 1 env E2E_HOLDER=later-run E2E_NOW=$((E2E_NOW + 100000)) "$e2e" lease acquire
+ok "leftovers keep the Lease long after the original TTL"
+
+fresh
+export FAKE_K8S_DOWN=1
+expect_status "an unreachable cluster has its own exit code" 4 "$e2e" run s1-image-bake -- "$work/bin/scenario"
+grep -q 'cannot reach the cluster' <<<"$out" || fail "the message says the cluster is unreachable" "$out"
+[ ! -s "$order" ] || fail "the scenario did not run"
+unset FAKE_K8S_DOWN
+ok "an unreachable cluster is told apart from a held Lease"
+
+fresh
+expect_status "a missing cap stops the run before the Lease" 2 env -u E2E_CAP_VCPU "$e2e" run s1-image-bake -- "$work/bin/scenario"
+expect_status "a bad VMID range stops the run" 2 env E2E_VMID_MIN=9100 E2E_VMID_MAX=9000 "$e2e" run s1-image-bake -- "$work/bin/scenario"
+expect_status "a missing node stops the run" 2 env -u E2E_NODE "$e2e" run s1-image-bake -- "$work/bin/scenario"
+! grep -q ' create ' "$FAKE_K8S/calls.log" || fail "no Lease was created for a bad input" "$(cat "$FAKE_K8S/calls.log")"
+ok "every input is checked before the Lease is taken"
+
+fresh
+rm "$work/api/_nodes_node1_status.json"
+expect_status "an API read failure after the Lease" 1 "$e2e" run s1-image-bake -- "$work/bin/scenario"
+lease_free || fail "the Lease is released when the preflight cannot read the API"
+[ ! -s "$order" ] || fail "the scenario did not run"
+ok "an API failure after the Lease is taken gives the Lease back"
+
+fresh
+export SCENARIO_SLEEP=30
+"$e2e" run s1-cancel -- "$work/bin/scenario" >"$work/cancel.out" 2>&1 &
+pid=$!
+for _ in $(seq 1 100); do
+  grep -q scenario "$order" && break
+  sleep 0.1
+done
+kill -TERM "$pid"
+status=0
+wait "$pid" || status=$?
+[ "$status" -ne 0 ] || fail "a cancelled run fails"
+grep -q teardown "$order" || fail "a cancelled run still tears down" "$(cat "$order")"
+lease_free || fail "a cancelled run gives the Lease back"
+keys_gone || fail "a cancelled run deletes the SSH key"
+grep -q 'cancelled' "$work/cancel.out" || fail "the run says it was cancelled" "$(cat "$work/cancel.out")"
+ok "a cancelled run stops the scenario, tears down, deletes the key and releases the Lease"
+
+fresh
+export SCENARIO_EXIT=7 E2E_KEEP_ON_FAILURE=1 FAKE_API_FAIL_PUT=9001
+expect_status "an incomplete hold still fails with the scenario status" 7 "$e2e" run s1-image-bake -- "$work/bin/scenario"
+grep -q 'hold is incomplete' <<<"$out" || fail "the incomplete hold is reported" "$out"
+[ -f "$work/k8s/lease.json" ] || fail "the Lease is still held"
+ok "a hold that cannot tag a guest says so and keeps the Lease"

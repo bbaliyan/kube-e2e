@@ -41,11 +41,11 @@ fixture() {
   printf '%s\n' "$2" >"$work/api/$(tr '/?=&' '____' <<<"$1").json"
 }
 
-# guest <vmid> <status> <maxmem> <maxcpu> <pool> <tags> [template]
+# guest <vmid> <status> <maxmem> <maxcpu> <pool> <tags> [template [node]]
 guest() {
   jq -n --argjson vmid "$1" --arg status "$2" --argjson mem "$3" --argjson cpu "$4" \
-    --arg pool "$5" --arg tags "$6" --argjson tpl "${7:-0}" \
-    '{vmid: $vmid, node: "node1", status: $status, maxmem: $mem, maxcpu: $cpu, pool: $pool, tags: $tags, template: $tpl}'
+    --arg pool "$5" --arg tags "$6" --argjson tpl "${7:-0}" --arg node "${8:-node1}" \
+    '{vmid: $vmid, node: $node, status: $status, maxmem: $mem, maxcpu: $cpu, pool: $pool, tags: $tags, template: $tpl}'
 }
 
 # guests <guest json>...: writes the guest list the fake API serves.
@@ -67,9 +67,10 @@ volumes() {
 baseline() {
   guests "$(guest 100 running $((20 * GIB)) 4 home '')" "$(guest 90 stopped $((64 * GIB)) 4 home '' 1)"
   fixture /nodes/node1/status "{\"data\":{\"memory\":{\"total\":$((64 * GIB))}}}"
-  fixture /nodes/node1/storage/thin1/status "{\"data\":{\"total\":$((1000 * GIB))}}"
+  fixture /nodes/node1/storage/thin1/status "{\"data\":{\"total\":$((1000 * GIB)),\"used\":$((100 * GIB))}}"
   volumes "100:$((300 * GIB))"
   export E2E_CAP_VMS=4 E2E_CAP_VCPU=16 E2E_CAP_RAM_BYTES=$((32 * GIB)) E2E_CAP_DISK_BYTES=$((200 * GIB))
+  export E2E_DISK_RULE_VERIFIED=1
   export E2E_REQ_VMS=2 E2E_REQ_VCPU=8 E2E_REQ_RAM_BYTES=$((16 * GIB)) E2E_REQ_DISK_BYTES=$((100 * GIB))
 }
 
