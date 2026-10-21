@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Entry point of the end-to-end harness. See README.md for the inputs.
+#
+#   e2e preflight
+#   e2e lease acquire|renew|hold <seconds>|release|release-stale|status
+#   e2e verify-clean <run id>
+#   e2e hold <run id> <seconds>
+#   e2e issue <scenario> <run id> [run url]
+#   e2e run <scenario> -- <command> [args]
+#
+# "run" is the whole sequence:
+#   lease, preflight, run tag and SSH key, the scenario command under a hard
+#   time limit, then on failure: logs first, then teardown (or a hold when
+#   E2E_KEEP_ON_FAILURE=1), then the check that nothing tagged remains.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/preflight.sh
+. "$here/lib/preflight.sh"
+# shellcheck source=lib/teardown.sh
+. "$here/lib/teardown.sh"
+# shellcheck source=lib/sshkey.sh
+. "$here/lib/sshkey.sh"
+# shellcheck source=lib/issue.sh
+. "$here/lib/issue.sh"
+
+readonly E2E_RUN_LIMIT_MAX=5400
+
+e2e_run() {
+  local scenario="${1:-}"
+  [ -n "$scenario" ] || e2e_usage_die "usage: e2e run <scenario> -- <command>"
+  shift
+  [ "${1:-}" = "--" ] || e2e_usage_die "usage: e2e run <scenario> -- <command>"
+  shift
+  [ "$#" -gt 0 ] || e2e_usage_die "no scenario command given"
+  e2e_require_env E2E_LOG_DIR E2E_TOKEN
+  local limit="${E2E_RUN_LIMIT_SECONDS:-$E2E_RUN_LIMIT_MAX}"
+  [[ "$limit" =~ ^[0-9]+$ ]] && [ "$limit" -ge 1 ] && [ "$limit" -le "$E2E_RUN_LIMIT_MAX" ] ||
+    e2e_usage_die "E2E_RUN_LIMIT_SECONDS must be 1 to $E2E_RUN_LIMIT_MAX"
+
+  E2E_RUN_ID="$(e2e_new_run_id)"
+  E2E_HOLDER="$E2E_RUN_ID"
+  export E2E_RUN_ID E2E_HOLDER
+  echo "run: $E2E_RUN_ID"
+
+  e2e_lease_acquire || return 3
+  if ! e2e_preflight; then
+    e2e_lease_release || true
+    return 1
+  fi
+
+  E2E_KEY_DIR="$(e2e_sshkey_create "$E2E_RUN_ID")"
+  export E2E_KEY_DIR
+  mkdir -p "$E2E_LOG_DIR"
+
+  local status=0
+  timeout --kill-after=60 "$limit" "$@" || status=$?
+  [ "$status" -ne 124 ] || echo "run: hit the $limit second limit" >&2
+
+  if [ "$status" -ne 0 ] && [ -n "${E2E_CAPTURE_HOOK:-}" ]; then
+    echo "run: capturing logs first"
+    "$E2E_CAPTURE_HOOK" "$E2E_LOG_DIR" || echo "run: the log capture hook failed" >&2
+  fi
+
+  local held=0
+  if [ "$status" -ne 0 ] && [ "${E2E_KEEP_ON_FAILURE:-0}" = 1 ]; then
+    e2e_hold "$E2E_RUN_ID" "$E2E_HOLD_MAX" && held=1
+    echo "run: held for debugging, no teardown. The SSH key stays in $E2E_KEY_DIR"
+  else
+    if [ -n "${E2E_TEARDOWN_HOOK:-}" ]; then
+      "$E2E_TEARDOWN_HOOK" || {
+        echo "run: the teardown hook failed" >&2
+        [ "$status" -ne 0 ] || status=1
+      }
+    fi
+    if ! e2e_verify_clean "$E2E_RUN_ID"; then
+      # Leftovers keep the Lease, so the next run cannot start beside them.
+      # The janitor deletes the guests and then releases the stale Lease.
+      held=1
+      [ "$status" -ne 0 ] || status=1
+    fi
+    e2e_sshkey_delete "$E2E_RUN_ID"
+  fi
+
+  [ "$held" = 1 ] || e2e_lease_release || true
+  if [ "$status" -ne 0 ] && [ -n "${E2E_ISSUE_REPO:-}" ]; then
+    e2e_failure_issue "$scenario" "$E2E_RUN_ID" "${E2E_RUN_URL:-}" || echo "run: could not file the failure issue" >&2
+  fi
+  return "$status"
+}
+
+main() {
+  local cmd="${1:-}"
+  [ "$#" -eq 0 ] || shift
+  case "$cmd" in
+    preflight) e2e_preflight ;;
+    lease)
+      case "${1:-}" in
+        acquire) e2e_lease_acquire ;;
+        renew) e2e_lease_renew ;;
+        hold) e2e_lease_hold "${2:-}" ;;
+        release) e2e_lease_release ;;
+        release-stale) e2e_lease_release_stale ;;
+        status) e2e_lease_status ;;
+        *) e2e_usage_die "usage: e2e lease acquire|renew|hold <seconds>|release|release-stale|status" ;;
+      esac
+      ;;
+    verify-clean) e2e_verify_clean "${1:?run id}" ;;
+    hold) e2e_hold "${1:?run id}" "${2:?seconds}" ;;
+    issue) e2e_failure_issue "${1:?scenario}" "${2:?run id}" "${3:-}" ;;
+    run) e2e_run "$@" ;;
+    *) e2e_usage_die "usage: e2e preflight|lease|verify-clean|hold|issue|run" ;;
+  esac
+}
+
+main "$@"

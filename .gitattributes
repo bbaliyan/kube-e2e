@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Forces LF on every text file: the scripts run on Linux runners, and a CRLF
+# shebang fails to exec.
+* text=auto eol=lf

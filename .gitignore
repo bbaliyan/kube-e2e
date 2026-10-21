@@ -1,0 +1,8 @@
+# Editor and OS
+.DS_Store
+tasks.json
+
+# A run writes its logs and keys outside the repo. Never commit them.
+*.pem
+*-key/
+logs/

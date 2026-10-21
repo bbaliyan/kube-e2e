@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Stand-in for kubectl in the tests. It keeps one Lease in $FAKE_K8S/lease.json
+# and behaves like the API server: create fails when the Lease exists, replace
+# fails when resourceVersion is stale. FAKE_K8S_BUMP_AFTER_GET=1 makes another
+# writer change the Lease right after each get, to test a lost race.
+set -euo pipefail
+
+store="$FAKE_K8S/lease.json"
+if [ "$1" = -n ]; then
+  shift 2
+fi
+verb="$1"
+case "$verb" in
+  get)
+    [ -f "$store" ] || {
+      echo "Error from server (NotFound)" >&2
+      exit 1
+    }
+    cat "$store"
+    if [ "${FAKE_K8S_BUMP_AFTER_GET:-0}" = 1 ]; then
+      jq '.metadata.resourceVersion = ((.metadata.resourceVersion | tonumber) + 1 | tostring)' "$store" >"$store.new"
+      mv "$store.new" "$store"
+    fi
+    ;;
+  create)
+    [ ! -f "$store" ] || {
+      echo "Error from server (AlreadyExists)" >&2
+      exit 1
+    }
+    jq '.metadata.resourceVersion = "1"' >"$store"
+    ;;
+  replace)
+    [ -f "$store" ] || exit 1
+    incoming="$(cat)"
+    current="$(jq -r '.metadata.resourceVersion' "$store")"
+    [ "$(jq -r '.metadata.resourceVersion // ""' <<<"$incoming")" = "$current" ] || {
+      echo "Error from server (Conflict)" >&2
+      exit 1
+    }
+    jq --arg v "$((current + 1))" '.metadata.resourceVersion = $v' <<<"$incoming" >"$store"
+    ;;
+  delete)
+    rm -f "$store"
+    ;;
+  *)
+    echo "fake kubectl: unsupported: $*" >&2
+    exit 2
+    ;;
+esac

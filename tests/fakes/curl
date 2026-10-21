@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Stand-in for curl in the tests. It serves JSON files from $FAKE_API and logs each call.
+# The request path maps to a file name: "/", "?", "=" and "&" become "_".
+#   /cluster/resources?type=vm  ->  $FAKE_API/_cluster_resources_type_vm.json
+# A missing file answers like curl -f on an HTTP error (exit 22). A missing file
+# for PUT answers with an empty success.
+set -euo pipefail
+
+# The token must come on standard input, never in the arguments.
+case "$*" in
+  *PVEAPIToken* | *fake-*)
+    echo "fake curl: a token is in the arguments" >&2
+    exit 99
+    ;;
+esac
+
+method=GET
+url=""
+data=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X)
+      method="$2"
+      shift 2
+      ;;
+    --data-urlencode)
+      data+=("$2")
+      shift 2
+      ;;
+    -K | --cacert)
+      shift 2
+      ;;
+    -*) shift ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+
+config="$(cat)"
+path="${url#"$E2E_API_URL"}"
+echo "$method $path ${data[*]:-}" >>"$FAKE_API/requests.log"
+sed -n 's/^header = "Authorization: PVEAPIToken=\(.*\)"$/\1/p' <<<"$config" >>"$FAKE_API/tokens.log"
+
+file="$FAKE_API/$(tr '/?=&' '____' <<<"$path").json"
+if [ -f "$file" ]; then
+  cat "$file"
+elif [ "$method" = PUT ]; then
+  echo '{"data":null}'
+else
+  exit 22
+fi
