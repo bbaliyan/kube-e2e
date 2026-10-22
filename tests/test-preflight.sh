@@ -104,12 +104,12 @@ grep -q 'leading zero' <<<"$out" || fail "the message names the leading zero" "$
 ok "a number with a leading zero is refused, not read as octal"
 
 baseline
-fixture /access/permissions '{"data":{"/":{"VM.Audit":1}}}'
+fixture '/access/permissions?path=/' '{"data":{"/":{"VM.Audit":1}}}'
 expect_status "an audit token without Sys.Audit" 1 "$e2e" preflight
 grep -q 'VM.Audit and Sys.Audit' <<<"$out" || fail "the message names the permissions" "$out"
-fixture /access/permissions '{"data":{}}'
+fixture '/access/permissions?path=/' '{"data":{}}'
 expect_status "an audit token with no permissions on /" 1 "$e2e" preflight
-rm "$work/api/_access_permissions.json"
+rm "$work/api/_access_permissions_path__.json"
 expect_status "permissions that cannot be read" 1 "$e2e" preflight
 ok "the preflight refuses an audit token that cannot see every guest"
 

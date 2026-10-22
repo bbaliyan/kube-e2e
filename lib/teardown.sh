@@ -85,16 +85,31 @@ e2e_hold() {
 
 # For the janitor. Deletes the Lease only when it is safe:
 #   normal Lease: expired, and no hold is active
-#   leftovers Lease: the guests of the run are gone, and the audit token can see them
-# The delete has uid and resourceVersion preconditions, so a newer Lease stays.
+#   marked Lease (leftovers=true): all of these hold
+#     the last renewal is older than the TTL, so no live run owns it
+#     no hold is active (the sentinel set by a mark counts as no hold)
+#     the guests of the run are gone, and the audit token can see them
+# The renew test does not use e2e_lease_expiry, because that includes the far
+# hold-until of the mark. The delete has uid and resourceVersion preconditions,
+# so a newer Lease stays.
 e2e_lease_release_stale() {
   e2e_require_env E2E_LEASE_NAME E2E_LEASE_NAMESPACE
-  local json now rc=0
+  local json now rc=0 renew_ends hold_until
   now="$(e2e_now)"
   json="$(e2e_lease_get)" || rc=$?
   [ "$rc" -ne 3 ] || return 0
   [ "$rc" -eq 0 ] || return 1
   if [ "$(e2e_lease_leftovers "$json")" = true ]; then
+    renew_ends="$(jq -r '((.metadata.annotations["kube-e2e/renew-epoch"] // "0") | tonumber) + (.spec.leaseDurationSeconds // 0)' <<<"$json")"
+    hold_until="$(e2e_lease_hold_until "$json")"
+    if [ "$renew_ends" -ge "$now" ]; then
+      echo "lease: renewed within its TTL, a run may still own it, kept"
+      return 0
+    fi
+    if [ "$hold_until" != "$E2E_LEFTOVERS_UNTIL" ] && [ "$hold_until" -gt "$now" ]; then
+      echo "lease: a hold is active, kept"
+      return 0
+    fi
     if ! e2e_verify_clean "$(e2e_lease_holder "$json")" >/dev/null 2>&1; then
       echo "lease: guests of $(e2e_lease_holder "$json") remain or cannot be read, kept"
       return 0

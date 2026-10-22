@@ -78,6 +78,7 @@ with exit 2. There are no defaults for caps or addresses.
 | `E2E_CAPTURE_LIMIT_SECONDS`, `E2E_TEARDOWN_LIMIT_SECONDS` | Optional. Limits of the hooks, at most 600 and 1800 |
 | `E2E_RENEW_INTERVAL_SECONDS` | Optional. Lease renewal every so many seconds, at most 3600. Default 600 |
 | `E2E_RENEW_RETRIES`, `E2E_RENEW_RETRY_SECONDS` | Optional. Failed renews before the run gives up the Lease (at most 10, default 5), and the first wait, doubled each time (at most 120, default 15) |
+| `E2E_FORCE_RELEASE` | Optional. `1` lets `lease release` delete a marked or held Lease. Use it only to unstick a Lease. See the procedure below |
 | `E2E_DISK_RULE_VERIFIED` | Set to `1` after you compared the disk numbers with `lvs`. See the rules |
 | `E2E_KEY_ROOT` | Optional. Parent directory of the one-time SSH key. Default `TMPDIR` |
 | `E2E_ISSUE_REPO`, `E2E_ISSUE_TOKEN` | Optional. Spoke that owns the scenario, and an issue-only token |
@@ -87,6 +88,19 @@ The scenario command and the hooks do not get `E2E_AUDIT_TOKEN` or
 `E2E_ISSUE_TOKEN`. They get `E2E_RUN_ID` and `E2E_KEY_DIR`. The scenario must tag every
 guest with the tags from `lib/tags.sh`: `kube-e2e`, the run id and
 `created-<epoch>`.
+
+## If a Lease is stuck
+
+A Lease stays marked `leftovers` when guests may remain. The janitor clears it
+after it deletes the guests. If the janitor is not running, clear it by hand.
+
+Warning: do these steps only when no run is active. A live run owns its Lease.
+
+1. Run `bin/e2e lease status`. Note the holder.
+2. Run `bin/e2e verify-clean <holder>`.
+3. If guests remain, delete them in Proxmox. Then run step 2 again.
+4. Run `E2E_HOLDER=<holder> E2E_FORCE_RELEASE=1 bin/e2e lease release`.
+5. If the Lease remains, run `kubectl -n <namespace> delete lease <name>`. Use this only as a last resort.
 
 ## Lease timing
 
@@ -118,6 +132,7 @@ carries `hold-until-<epoch>`. The janitor reads the same tags.
 - Never run these scripts with `set -x` or `bash -x`. The tokens are in the environment, and a trace prints them.
 - The failure issue is deduplicated by a search on the title. GitHub's search index can lag by a minute or more, so two failures close together can open two issues. Close the extra by hand.
 - `e2e lease release-stale` needs `kubectl delete --raw` with a body on standard input. Verify it against your cluster once.
+- The audit token check reads `GET /access/permissions?path=/` and wants `VM.Audit` and `Sys.Audit` with the value 1 (propagate). Verify this once against your Proxmox version, because the response shape comes from the API documentation.
 - The Lease time uses `jq`, so no GNU `date` is needed. The scripts still expect `bash` 4.4 or newer, `curl`, `jq`, `kubectl` and `timeout`.
 
 ## Tests

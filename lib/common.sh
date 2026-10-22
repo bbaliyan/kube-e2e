@@ -56,7 +56,7 @@ e2e_api() {
 # on / gets a shorter guest list and no error, so teardown would pass wrongly.
 e2e_audit_check() {
   local perms
-  perms="$(e2e_api E2E_AUDIT_TOKEN GET /access/permissions)" || {
+  perms="$(e2e_api E2E_AUDIT_TOKEN GET '/access/permissions?path=/')" || {
     echo "kube-e2e: cannot read the permissions of the audit token" >&2
     return 1
   }

@@ -66,7 +66,7 @@ volumes() {
 # A host with 64 GiB RAM, a 1000 GiB pool, one running home guest of 20 GiB,
 # one template, 300 GiB provisioned, and no e2e guests.
 baseline() {
-  fixture /access/permissions '{"data":{"/":{"VM.Audit":1,"Sys.Audit":1}}}'
+  fixture '/access/permissions?path=/' '{"data":{"/":{"VM.Audit":1,"Sys.Audit":1}}}'
   guests "$(guest 100 running $((20 * GIB)) 4 home '')" "$(guest 90 stopped $((64 * GIB)) 4 home '' 1)"
   fixture /nodes/node1/status "{\"data\":{\"memory\":{\"total\":$((64 * GIB))}}}"
   fixture /nodes/node1/storage/thin1/status "{\"data\":{\"total\":$((1000 * GIB)),\"used\":$((100 * GIB))}}"

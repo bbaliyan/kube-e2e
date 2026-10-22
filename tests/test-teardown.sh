@@ -108,7 +108,7 @@ ok "release-stale clears a leftovers Lease only after the guests are gone"
 
 mark_leftovers e2e-1-aaa
 guests "$(guest 100 running $((20 * GIB)) 4 home '')"
-expect_status "a leftovers Lease changed after the read" 1 env FAKE_K8S_BUMP_AFTER_GET=1 E2E_HOLDER=janitor "$e2e" lease release-stale
+expect_status "a leftovers Lease changed after the read" 1 env FAKE_K8S_BUMP_AFTER_GET=1 E2E_HOLDER=janitor E2E_NOW=$((t0 + 100000)) "$e2e" lease release-stale
 [ -f "$work/k8s/lease.json" ] || fail "release-stale does not delete a Lease that changed after the read"
 ok "release-stale deletes only the Lease it read"
 
@@ -121,7 +121,44 @@ expect_status "release-stale on an expired Lease" 0 env E2E_HOLDER=janitor E2E_N
 ok "release-stale keeps a valid Lease and deletes an expired one"
 
 baseline
-fixture /access/permissions '{"data":{"/":{"VM.Audit":1}}}'
+fixture '/access/permissions?path=/' '{"data":{"/":{"VM.Audit":1}}}'
 expect_status "verify-clean with an audit token that cannot see every guest" 1 "$e2e" verify-clean e2e-1-aaa
 grep -q 'VM.Audit and Sys.Audit' <<<"$out" || fail "the message names the permissions" "$out"
 ok "the teardown check refuses an audit token that cannot see every guest"
+
+# --- Added after the third review ---
+
+baseline
+
+ok_guests() { guests "$(guest 100 running $((20 * GIB)) 4 home '')"; }
+lease_field() { jq -r ".metadata.annotations[\"kube-e2e/$1\"]" "$work/k8s/lease.json"; }
+
+# A marked Lease that was renewed a minute ago belongs to a live run, even when no guest has its tag yet.
+ok_guests
+mark_leftovers e2e-1-aaa
+expect_status "release-stale a minute after the mark" 0 env E2E_HOLDER=janitor E2E_NOW=$((t0 + 60)) "$e2e" lease release-stale
+grep -q 'renewed within' <<<"$out" || fail "the message says a run may still own it" "$out"
+[ -f "$work/k8s/lease.json" ] || fail "the Lease of a live run is not deleted"
+ok "release-stale keeps a marked Lease that was renewed within its TTL, although no guest is tagged"
+
+# An active hold keeps the Lease.
+reset_lease
+env E2E_HOLDER=e2e-1-aaa "$e2e" lease acquire >/dev/null
+env E2E_HOLDER=e2e-1-aaa "$e2e" lease hold 3600 >/dev/null
+expect_status "release-stale a minute after a hold" 0 env E2E_HOLDER=janitor E2E_NOW=$((t0 + 60)) "$e2e" lease release-stale
+[ -f "$work/k8s/lease.json" ] || fail "release-stale does not delete a held Lease"
+ok "release-stale keeps a Lease under a hold"
+
+# A hold that is still active keeps a marked Lease even when the renew is old.
+reset_lease
+env E2E_HOLDER=e2e-1-aaa "$e2e" lease acquire >/dev/null
+jq --arg r "$((t0 - 8000))" --arg h "$((t0 + 5000))" \
+  '.metadata.annotations["kube-e2e/leftovers"] = "true" | .metadata.annotations["kube-e2e/renew-epoch"] = $r | .metadata.annotations["kube-e2e/hold-until-epoch"] = $h' \
+  "$work/k8s/lease.json" >"$work/k8s/lease.new"
+mv "$work/k8s/lease.new" "$work/k8s/lease.json"
+expect_status "release-stale during an active hold" 0 env E2E_HOLDER=janitor E2E_NOW="$t0" "$e2e" lease release-stale
+grep -q 'hold is active' <<<"$out" || fail "the message says a hold is active" "$out"
+[ -f "$work/k8s/lease.json" ] || fail "an active hold keeps the Lease"
+expect_status "release-stale after the hold" 0 env E2E_HOLDER=janitor E2E_NOW=$((t0 + 5001)) "$e2e" lease release-stale
+[ ! -f "$work/k8s/lease.json" ] || fail "the Lease goes once the hold has passed and the guests are gone"
+ok "release-stale honours a hold on a marked Lease, and deletes it after the hold"

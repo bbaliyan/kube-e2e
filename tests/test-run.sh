@@ -323,7 +323,7 @@ grep -q 'PUT /nodes/node1/lxc/9100/config' "$FAKE_API/requests.log" || fail "a c
 ok "a hold tags containers through the lxc path"
 
 fresh
-rm "$work/api/_access_permissions.json"
+rm "$work/api/_access_permissions_path__.json"
 expect_status "an audit token that cannot be checked" 1 "$e2e" run s1-image-bake -- "$work/bin/scenario"
 [ ! -s "$order" ] || fail "the scenario did not run"
 lease_free || fail "the Lease is released"
@@ -350,3 +350,27 @@ lease_free || fail "a second signal during teardown does not leave the Lease" "$
 keys_gone || fail "a second signal during teardown does not leave the key"
 unset FAKE_TEARDOWN_FLAG
 ok "a second signal during teardown does not cut the teardown short"
+
+# --- Added after the third review ---
+
+fresh
+export SCENARIO_SLEEP=30 E2E_RENEW_INTERVAL_SECONDS=1 E2E_RENEW_RETRIES=2 E2E_RENEW_RETRY_SECONDS=1
+# The Lease stays ours, but every renew fails for a while (an API outage). The teardown hook heals it.
+cat >"$work/bin/outage" <<'EOF'
+#!/usr/bin/env bash
+echo scenario >>"$ORDER"
+: >"$FAKE_K8S/replace-fail"
+exec sleep 30
+EOF
+cat >"$work/bin/heal-teardown" <<'EOF'
+#!/usr/bin/env bash
+echo teardown >>"$ORDER"
+rm -f "$FAKE_K8S/replace-fail"
+echo '{"data":[{"vmid":100,"node":"node1","type":"qemu","status":"running","maxmem":1,"maxcpu":1,"pool":"home","tags":""}]}' >"$GUEST_FILE"
+EOF
+chmod +x "$work/bin/outage" "$work/bin/heal-teardown"
+run_status env E2E_TEARDOWN_HOOK="$work/bin/heal-teardown" timeout 40 "$e2e" run s1-outage -- "$work/bin/outage"
+[ "$status" -ne 0 ] && [ "$status" -ne 124 ] || fail "a run whose renews failed ends with a failure (got $status)" "$out"
+grep -q 'lost the Lease' <<<"$out" || fail "the loop gave up" "$out"
+lease_free || fail "a Lease that is still ours is cleared and released after a clean check" "$(cat "$work/k8s/lease.json" 2>/dev/null)"
+ok "when the renews failed but the Lease is still ours, a clean check clears and releases it"

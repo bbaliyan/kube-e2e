@@ -102,9 +102,16 @@ e2e_teardown_phase() {
     }
   fi
   if e2e_verify_clean "$E2E_RUN_ID"; then
+    # The renew loop may have given up while the Lease is still ours, for
+    # example after a long API outage. Read it again before leaving it alone.
+    local lease_json lease_rc=0
     if [ "$run_lost" = 1 ]; then
-      run_lease=0
-    elif ! e2e_lease_clear_leftovers; then
+      lease_json="$(e2e_lease_get)" || lease_rc=$?
+      if [ "$lease_rc" -ne 0 ] || [ "$(e2e_lease_holder "$lease_json")" != "$E2E_HOLDER" ]; then
+        run_lease=0
+      fi
+    fi
+    if [ "$run_lease" = 1 ] && ! e2e_lease_clear_leftovers; then
       echo "run: could not clear the leftovers mark, the Lease stays" >&2
       run_keep_lease=1
     fi

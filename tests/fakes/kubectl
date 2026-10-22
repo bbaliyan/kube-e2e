@@ -6,6 +6,7 @@
 # when the uid or resourceVersion no longer match.
 #   FAKE_K8S_BUMP_AFTER_GET=1  another writer changes the Lease right after each get
 #   FAKE_K8S_DOWN=1            every call fails like an unreachable cluster
+#   a file replace-fail in $FAKE_K8S makes every replace fail with Conflict
 #   a file conflict-once in $FAKE_K8S makes the next replace fail with Conflict
 #   FAKE_TEARDOWN_FLAG=file    calls made while the file exists go to during-teardown.log
 #   FAKE_K8S_SLEEP=n           create takes n seconds
@@ -48,6 +49,10 @@ case "$verb" in
     ;;
   replace)
     [ -f "$store" ] || exit 1
+    if [ -e "$FAKE_K8S/replace-fail" ]; then
+      echo "Error from server (Conflict)" >&2
+      exit 1
+    fi
     if [ -e "$FAKE_K8S/conflict-once" ]; then
       rm -f "$FAKE_K8S/conflict-once"
       echo "Error from server (Conflict)" >&2
