@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Preflight: refuse a run that would overcommit the host. Source this file.
 #
-# Reads sizes in bytes from the Proxmox API with the read-only audit token.
+# Reads sizes in bytes from the Proxmox API with the read-only audit token. The
+# token needs VM.Audit and Sys.Audit on /, and the preflight checks that.
 # Inputs (all required, none has a default):
 #   E2E_API_URL E2E_AUDIT_TOKEN E2E_NODE E2E_STORAGE E2E_POOL
 #   E2E_VMID_MIN E2E_VMID_MAX               the reserved VMID range of the e2e guests
@@ -39,9 +40,13 @@ e2e_preflight_row() { # name need limit
 
 e2e_preflight() {
   e2e_preflight_inputs
+  e2e_audit_check || return 1
 
   local guests node_status storage_status content
   guests="$(e2e_api E2E_AUDIT_TOKEN GET '/cluster/resources?type=vm')" || e2e_die "cannot read the guest list"
+  if [ "$(jq -r '.data | length' <<<"$guests")" = 0 ]; then
+    e2e_die "the guest list is empty, so the audit token may not see the guests"
+  fi
   node_status="$(e2e_api E2E_AUDIT_TOKEN GET "/nodes/$E2E_NODE/status")" || e2e_die "cannot read the host status"
   storage_status="$(e2e_api E2E_AUDIT_TOKEN GET "/nodes/$E2E_NODE/storage/$E2E_STORAGE/status")" || e2e_die "cannot read the storage status"
   content="$(e2e_api E2E_AUDIT_TOKEN GET "/nodes/$E2E_NODE/storage/$E2E_STORAGE/content")" || e2e_die "cannot read the storage content"

@@ -45,7 +45,7 @@ expect_status "a hold of one hour" 0 as run-a 100 hold 3600
 expect_status "a hold longer than two hours" 2 as run-a 100 hold 7201
 expect_status "a hold by another run" 1 as run-b 100 hold 60
 expect_status "release is refused during a hold" 1 as run-a 200 release
-grep -q 'hold is active' <<<"$out" || fail "the refusal says why" "$out"
+grep -q 'not released' <<<"$out" || fail "the refusal says why" "$out"
 [ -f "$work/k8s/lease.json" ] || fail "the Lease is still there"
 expect_status "a forced release works" 0 env E2E_FORCE_RELEASE=1 E2E_HOLDER=run-a E2E_NOW=$((t0 + 200)) "$e2e" lease release
 [ ! -f "$work/k8s/lease.json" ] || fail "the Lease is gone"
@@ -105,3 +105,50 @@ chmod +x "$work/bsd/date"
 run_status env PATH="$work/bsd:$PATH" bash -c ". '$root/lib/lease.sh'; e2e_lease_iso 1700000000"
 [ "$out" = "2023-11-14T22:13:20.000000Z" ] || fail "the Lease time is formatted without GNU date" "$out"
 ok "the Lease time does not depend on GNU date"
+
+# --- Added after the second review ---
+
+rm -f "$work/k8s/lease.json"
+as run-a 0 acquire >/dev/null
+for sub in renew release status; do
+  expect_status "$sub with the cluster unreachable" 1 env FAKE_K8S_DOWN=1 E2E_HOLDER=run-a "$e2e" lease "$sub"
+  grep -q 'cannot reach the cluster' <<<"$out" || fail "$sub says the cluster is unreachable" "$out"
+  ! grep -q 'not found' <<<"$out" || fail "$sub does not call an unreachable cluster 'not found'" "$out"
+done
+ok "renew, release and status tell an unreachable cluster from a missing Lease"
+
+expect_status "a delete that is forbidden" 4 env FAKE_K8S_DELETE_FORBIDDEN=1 E2E_HOLDER=run-a "$e2e" lease release
+grep -q 'cannot delete it: .*Forbidden' <<<"$out" || fail "the delete error is shown" "$out"
+[ -f "$work/k8s/lease.json" ] || fail "the Lease stays"
+ok "a delete that fails for a reason other than a conflict shows the reason"
+
+# The mark survives one conflict with another writer, and a renew never lowers hold-until while marked.
+rm -f "$work/k8s/lease.json"
+as run-a 0 acquire >/dev/null
+: >"$work/k8s/conflict-once"
+run_status env E2E_HOLDER=run-a bash -c ". '$root/lib/lease.sh'; e2e_lease_mark_leftovers"
+[ "$status" -eq 0 ] || fail "the mark is retried after a conflict" "$out"
+[ "$(jq -r '.metadata.annotations["kube-e2e/leftovers"]' "$work/k8s/lease.json")" = true ] || fail "the Lease is marked"
+[ "$(jq -r '.metadata.annotations["kube-e2e/hold-until-epoch"]' "$work/k8s/lease.json")" = 9999999999 ] || fail "the mark holds far into the future"
+expect_status "a hold on a marked Lease" 0 as run-a 10 hold 600
+[ "$(jq -r '.metadata.annotations["kube-e2e/hold-until-epoch"]' "$work/k8s/lease.json")" = 9999999999 ] || fail "a hold does not lower hold-until"
+expect_status "release of a marked Lease" 1 as run-a 10 release
+expect_status "a plain renew keeps the mark" 0 as run-a 20 renew
+[ "$(jq -r '.metadata.annotations["kube-e2e/leftovers"]' "$work/k8s/lease.json")" = true ] || fail "a plain renew keeps the mark"
+run_status env E2E_HOLDER=run-a bash -c ". '$root/lib/lease.sh'; e2e_lease_clear_leftovers"
+[ "$(jq -r '.metadata.annotations["kube-e2e/leftovers"]' "$work/k8s/lease.json")" = false ] || fail "the mark is cleared"
+[ "$(jq -r '.metadata.annotations["kube-e2e/hold-until-epoch"]' "$work/k8s/lease.json")" = 0 ] || fail "clearing lowers hold-until to zero"
+expect_status "release after the mark is cleared" 0 as run-a 30 release
+ok "the mark survives a conflict, is never lowered by a hold, and clears only on request"
+
+# A Lease marked leftovers is held whatever the clock says.
+rm -f "$work/k8s/lease.json"
+as run-a 0 acquire >/dev/null
+run_status env E2E_HOLDER=run-a bash -c ". '$root/lib/lease.sh'; e2e_lease_hold 60"
+jq '.metadata.annotations["kube-e2e/hold-until-epoch"] = "0" | .metadata.annotations["kube-e2e/renew-epoch"] = "0"' "$work/k8s/lease.json" >"$work/k8s/lease.new"
+mv "$work/k8s/lease.new" "$work/k8s/lease.json"
+expect_status "an old Lease with leftovers" 1 as run-b 100000 acquire
+ok "a Lease marked leftovers is refused even after its TTL"
+
+expect_status "a hold written with a leading zero" 2 as run-a 10 hold 0900
+ok "a number with a leading zero is refused, not read as octal"

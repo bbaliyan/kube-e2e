@@ -17,15 +17,26 @@ e2e_key_dir() {
 e2e_sshkey_create() {
   local dir
   dir="$(e2e_key_dir "$1")"
-  mkdir -m 700 "$dir" || e2e_die "key directory already exists: $dir"
-  ssh-keygen -q -t ed25519 -N '' -C "$1" -f "$dir/id"
+  if ! mkdir -m 700 "$dir"; then
+    echo "kube-e2e: key directory already exists: $dir" >&2
+    return 1
+  fi
+  if ! ssh-keygen -q -t ed25519 -N '' -C "$1" -f "$dir/id"; then
+    rm -rf "$dir"
+    echo "kube-e2e: ssh-keygen failed" >&2
+    return 1
+  fi
   echo "$dir"
 }
 
-# Deletes the pair and fails if anything is left.
+# Deletes the pair and returns 1 if anything is left. It never exits, because the
+# exit trap calls it and must go on to release the Lease.
 e2e_sshkey_delete() {
   local dir
   dir="$(e2e_key_dir "$1")"
   rm -rf "$dir"
-  [ ! -e "$dir" ] || e2e_die "key directory is still there: $dir"
+  if [ -e "$dir" ]; then
+    echo "kube-e2e: key directory is still there: $dir" >&2
+    return 1
+  fi
 }

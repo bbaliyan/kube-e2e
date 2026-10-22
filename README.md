@@ -11,26 +11,34 @@ commit SHA.
 
 `bin/e2e run <scenario> -- <command>` runs one scenario in this order:
 
-1. Check every input. A missing or bad input stops the run with exit 2, before any Lease is taken.
+1. Check every input. A missing or bad input stops the run with exit 2, before any Lease is taken. A number with a leading zero is refused, not read as octal.
 2. Take the Lease. If another run holds it, stop with exit 3. If the cluster cannot be reached, stop with exit 4.
-3. Run the preflight. If the request is over a cap, stop with exit 1.
+3. Run the preflight. If the request is over a cap, or the audit token cannot see every guest, stop with exit 1.
 4. Make a run id and a one-time SSH key.
-5. Run the scenario command with a hard limit of 90 minutes. A loop renews the Lease every 10 minutes meanwhile.
-6. If the scenario failed, capture logs first. The hook has at most 10 minutes.
-7. If `E2E_KEEP_ON_FAILURE=1` and the scenario failed, hold the guests for 2 hours. Skip the teardown.
-8. Otherwise run the teardown hook (at most 30 minutes) and verify that no guest with the run tag remains.
-9. Delete the SSH key and release the Lease.
-10. If the scenario failed and `E2E_ISSUE_REPO` is set, open or update one failure issue.
+5. Mark the Lease `leftovers` with a hold far in the future. From now on, guests may exist, and a killed run keeps the Lease.
+6. Run the scenario command with a hard limit of 90 minutes. A loop renews the Lease every 10 minutes. A failed renew is retried with a growing wait. If it keeps failing, the run no longer owns the Lease: the loop stops the scenario, and the run tears down without touching the Lease.
+7. If the scenario failed, capture logs first. The hook has at most 10 minutes.
+8. If `E2E_KEEP_ON_FAILURE=1` and the scenario failed, hold the guests for 2 hours. Skip the teardown. The Lease stays marked.
+9. Otherwise stop the renew loop, run the teardown hook (at most 30 minutes) and verify that no guest with the run tag remains.
+10. If the check is clean, clear the mark, delete the SSH key and release the Lease.
+11. If the scenario failed and `E2E_ISSUE_REPO` is set, open or update one failure issue.
 
-INT and TERM stop the scenario, and the run still tears down. Any early exit
-tears down, deletes the key and releases the Lease.
+INT and TERM stop the scenario, and the run still tears down. A second signal
+does not cut the teardown short. Any early exit tears down, releases the Lease
+first and then deletes the key.
 
-If a guest with the run tag remains after teardown, the run fails and marks the
-Lease as `leftovers` with a hold far in the future. No later run can take it.
-The janitor deletes the guests, then runs `bin/e2e lease release-stale`. That
-call deletes a leftovers Lease only when the guests of the run are gone. It
-deletes with uid and resourceVersion preconditions, so it never deletes a
-newer Lease.
+The mark is the key rule. While a Lease is marked `leftovers`, no other run can
+take it, whatever the clock says, and a renew never lowers its hold-until time.
+Only the holder after a clean check, or `bin/e2e lease release-stale` after the
+janitor deleted the guests, clears it. `release-stale` checks that the audit
+token can see the guests and that none of the run remains. It deletes with uid
+and resourceVersion preconditions, so it never deletes a newer Lease. A Lease
+that is not marked is freed by its TTL, 2 hours after the last renewal.
+
+Exit codes: 0 pass, 1 refused or leftovers, 2 bad input, 3 the Lease is held,
+4 the cluster is unreachable. The status of a failing scenario is passed on as
+it is, so a scenario that exits with 1 to 4 looks like one of these codes. The
+`run:` lines in the output say which it was.
 
 ## Commands
 
@@ -52,7 +60,7 @@ with exit 2. There are no defaults for caps or addresses.
 |---|---|
 | `E2E_API_URL` | Proxmox API base URL, ending in `/api2/json` |
 | `E2E_CA_FILE` | Optional. CA file for the API |
-| `E2E_AUDIT_TOKEN` | Read-only audit token, `user@realm!name=secret`. Used to read |
+| `E2E_AUDIT_TOKEN` | Read-only audit token, `user@realm!name=secret`. It needs `VM.Audit` and `Sys.Audit` on `/`, or the guest list is shorter and no error shows. The harness checks this and refuses to go on |
 | `E2E_TOKEN` | The end-to-end token. Used to tag guests |
 | `E2E_NODE`, `E2E_STORAGE` | Node name and thin-pool storage id |
 | `E2E_POOL` | Resource pool of the end-to-end guests |
@@ -69,14 +77,25 @@ with exit 2. There are no defaults for caps or addresses.
 | `E2E_RUN_LIMIT_SECONDS` | Optional. Hard limit, at most 5400 |
 | `E2E_CAPTURE_LIMIT_SECONDS`, `E2E_TEARDOWN_LIMIT_SECONDS` | Optional. Limits of the hooks, at most 600 and 1800 |
 | `E2E_RENEW_INTERVAL_SECONDS` | Optional. Lease renewal every so many seconds, at most 3600. Default 600 |
+| `E2E_RENEW_RETRIES`, `E2E_RENEW_RETRY_SECONDS` | Optional. Failed renews before the run gives up the Lease (at most 10, default 5), and the first wait, doubled each time (at most 120, default 15) |
 | `E2E_DISK_RULE_VERIFIED` | Set to `1` after you compared the disk numbers with `lvs`. See the rules |
 | `E2E_KEY_ROOT` | Optional. Parent directory of the one-time SSH key. Default `TMPDIR` |
 | `E2E_ISSUE_REPO`, `E2E_ISSUE_TOKEN` | Optional. Spoke that owns the scenario, and an issue-only token |
 | `E2E_RUN_URL` | Optional. Link to the run, put in the failure issue |
 
-The scenario command gets `E2E_RUN_ID` and `E2E_KEY_DIR`. It must tag every
+The scenario command and the hooks do not get `E2E_AUDIT_TOKEN` or
+`E2E_ISSUE_TOKEN`. They get `E2E_RUN_ID` and `E2E_KEY_DIR`. The scenario must tag every
 guest with the tags from `lib/tags.sh`: `kube-e2e`, the run id and
 `created-<epoch>`.
+
+## Lease timing
+
+The worst case of one run is the run limit, the capture limit and the teardown
+limit together: about 7900 seconds with the kill delays. That is more than the
+2 hour TTL. The TTL does not need to cover it, because the Lease is marked
+`leftovers` for the whole run, and a marked Lease is never freed by the clock.
+The TTL frees only an unmarked Lease, for example one left by a run that never
+reached the scenario.
 
 ## The rules
 
@@ -87,6 +106,7 @@ guest with the tags from `lib/tags.sh`: `kube-e2e`, the run id and
 - **The disk rule fails closed.** Until `E2E_DISK_RULE_VERIFIED=1`, every preflight is refused. Compare the numbers the preflight prints with `lvs` on the host, including snapshots, then set the variable.
 - One Lease serialises runs from GitHub and GitLab. It expires 2 hours after the last renewal. A hold renews it.
 - A run takes at most 90 minutes. A hold takes at most 2 hours.
+- An empty guest list is an error, because a host always has guests. Teardown never passes on a list the audit token may not see.
 
 ## Tags
 

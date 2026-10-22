@@ -95,3 +95,26 @@ baseline
 ! grep -qv '^audit@pve!audit=fake-audit-secret$' "$FAKE_API/tokens.log" || fail "only the audit token is used" "$(cat "$FAKE_API/tokens.log")"
 ! grep -q -v '^GET ' "$FAKE_API/requests.log" || fail "the preflight only reads" "$(cat "$FAKE_API/requests.log")"
 ok "the preflight uses the read-only audit token and only reads"
+
+# --- Added after the second review ---
+
+baseline
+expect_status "a leading zero is not octal" 2 env E2E_CAP_VMS=08 "$e2e" preflight
+grep -q 'leading zero' <<<"$out" || fail "the message names the leading zero" "$out"
+ok "a number with a leading zero is refused, not read as octal"
+
+baseline
+fixture /access/permissions '{"data":{"/":{"VM.Audit":1}}}'
+expect_status "an audit token without Sys.Audit" 1 "$e2e" preflight
+grep -q 'VM.Audit and Sys.Audit' <<<"$out" || fail "the message names the permissions" "$out"
+fixture /access/permissions '{"data":{}}'
+expect_status "an audit token with no permissions on /" 1 "$e2e" preflight
+rm "$work/api/_access_permissions.json"
+expect_status "permissions that cannot be read" 1 "$e2e" preflight
+ok "the preflight refuses an audit token that cannot see every guest"
+
+baseline
+guests
+expect_status "an empty guest list" 1 "$e2e" preflight
+grep -q 'guest list is empty' <<<"$out" || fail "the message says the list is empty" "$out"
+ok "an empty guest list is refused, since the token may not see the guests"

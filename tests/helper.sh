@@ -13,6 +13,7 @@ export PATH="$root/tests/fakes:$PATH"
 export FAKE_API="$work/api" FAKE_K8S="$work/k8s" FAKE_GH="$work/gh"
 export E2E_KEY_ROOT="$work/keys" E2E_LOG_DIR="$work/logs"
 export E2E_NOW=1700000000
+export E2E_RETRY_SLEEP_SECONDS=0
 
 # Fake values only. The real ones come from the environment of the runner.
 export E2E_API_URL="https://pve.example.test:8006/api2/json"
@@ -41,11 +42,11 @@ fixture() {
   printf '%s\n' "$2" >"$work/api/$(tr '/?=&' '____' <<<"$1").json"
 }
 
-# guest <vmid> <status> <maxmem> <maxcpu> <pool> <tags> [template [node]]
+# guest <vmid> <status> <maxmem> <maxcpu> <pool> <tags> [template [node [type]]]
 guest() {
   jq -n --argjson vmid "$1" --arg status "$2" --argjson mem "$3" --argjson cpu "$4" \
-    --arg pool "$5" --arg tags "$6" --argjson tpl "${7:-0}" --arg node "${8:-node1}" \
-    '{vmid: $vmid, node: $node, status: $status, maxmem: $mem, maxcpu: $cpu, pool: $pool, tags: $tags, template: $tpl}'
+    --arg pool "$5" --arg tags "$6" --argjson tpl "${7:-0}" --arg node "${8:-node1}" --arg type "${9:-qemu}" \
+    '{vmid: $vmid, node: $node, type: $type, status: $status, maxmem: $mem, maxcpu: $cpu, pool: $pool, tags: $tags, template: $tpl}'
 }
 
 # guests <guest json>...: writes the guest list the fake API serves.
@@ -65,6 +66,7 @@ volumes() {
 # A host with 64 GiB RAM, a 1000 GiB pool, one running home guest of 20 GiB,
 # one template, 300 GiB provisioned, and no e2e guests.
 baseline() {
+  fixture /access/permissions '{"data":{"/":{"VM.Audit":1,"Sys.Audit":1}}}'
   guests "$(guest 100 running $((20 * GIB)) 4 home '')" "$(guest 90 stopped $((64 * GIB)) 4 home '' 1)"
   fixture /nodes/node1/status "{\"data\":{\"memory\":{\"total\":$((64 * GIB))}}}"
   fixture /nodes/node1/storage/thin1/status "{\"data\":{\"total\":$((1000 * GIB)),\"used\":$((100 * GIB))}}"

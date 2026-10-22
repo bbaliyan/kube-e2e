@@ -22,11 +22,16 @@ e2e_require_env() {
   done
 }
 
+# A whole number without a leading zero, so bash never reads it as octal.
+e2e_is_uint() {
+  [[ "${1:-}" =~ ^(0|[1-9][0-9]*)$ ]]
+}
+
 e2e_require_uint() {
   local name
   for name in "$@"; do
     e2e_require_env "$name"
-    [[ "${!name}" =~ ^[0-9]+$ ]] || e2e_usage_die "$name must be a whole number"
+    e2e_is_uint "${!name}" || e2e_usage_die "$name must be a whole number without a leading zero"
   done
 }
 
@@ -45,4 +50,18 @@ e2e_api() {
   [ -z "${E2E_CA_FILE:-}" ] || ca=(--cacert "$E2E_CA_FILE")
   printf 'header = "Authorization: PVEAPIToken=%s"\n' "${!token_var}" |
     curl -fsS "${ca[@]}" -K - -X "$method" "$@" "${E2E_API_URL%/}$path"
+}
+
+# The audit token must see every guest. A token without VM.Audit and Sys.Audit
+# on / gets a shorter guest list and no error, so teardown would pass wrongly.
+e2e_audit_check() {
+  local perms
+  perms="$(e2e_api E2E_AUDIT_TOKEN GET /access/permissions)" || {
+    echo "kube-e2e: cannot read the permissions of the audit token" >&2
+    return 1
+  }
+  jq -e '.data["/"]["VM.Audit"] == 1 and .data["/"]["Sys.Audit"] == 1' <<<"$perms" >/dev/null || {
+    echo "kube-e2e: the audit token needs VM.Audit and Sys.Audit on / to see every guest" >&2
+    return 1
+  }
 }

@@ -10,10 +10,11 @@ expect_status "a clean host passes" 0 "$e2e" verify-clean e2e-1-aaa
 ok "nothing tagged remains: pass"
 
 guests
-expect_status "an empty guest list passes" 0 "$e2e" verify-clean e2e-1-aaa
+expect_status "an empty guest list fails closed" 1 "$e2e" verify-clean e2e-1-aaa
+grep -q "empty" <<<"$out" || fail "the message says the list is empty" "$out"
 fixture /cluster/resources?type=vm '{"nope":[]}'
 expect_status "an unexpected shape fails closed" 1 "$e2e" verify-clean e2e-1-aaa
-ok "an empty guest list passes and an unexpected shape fails"
+ok "an empty guest list and an unexpected shape both fail, since the audit token may not see the guests"
 
 guests "$(guest 100 running $((20 * GIB)) 4 home '')" \
   "$(guest 9001 running $((4 * GIB)) 2 e2e 'kube-e2e;e2e-1-aaa;created-1')" \
@@ -77,6 +78,7 @@ rm -f "$work/api/_cluster_resources_type_vm.json"
 expect_status "a hold with an unreadable guest list" 1 env E2E_HOLDER=e2e-1-aaa "$e2e" hold e2e-1-aaa 3600
 grep -q 'cannot read the guest list' <<<"$out" || fail "the failure is loud" "$out"
 ! grep -q '^PUT' "$FAKE_API/requests.log" || fail "nothing was tagged"
+[ "$(jq -r '.metadata.annotations["kube-e2e/leftovers"]' "$work/k8s/lease.json")" = true ] || fail "the Lease is held although the list could not be read"
 ok "a guest list read failure fails the hold instead of exiting 0"
 
 # One failing tag does not stop the others, holds the Lease, and fails the hold.
@@ -99,13 +101,13 @@ mark_leftovers e2e-1-aaa
 expect_status "release-stale with the guests still there" 0 env E2E_HOLDER=janitor E2E_NOW=$((t0 + 100000)) "$e2e" lease release-stale
 grep -q 'remain' <<<"$out" || fail "the leftovers are named" "$out"
 [ -f "$work/k8s/lease.json" ] || fail "the Lease stays while the guests remain"
-guests
+guests "$(guest 100 running $((20 * GIB)) 4 home '')"
 expect_status "release-stale after the guests are gone" 0 env E2E_HOLDER=janitor E2E_NOW=$((t0 + 100000)) "$e2e" lease release-stale
 [ ! -f "$work/k8s/lease.json" ] || fail "the Lease is deleted once the guests are gone"
 ok "release-stale clears a leftovers Lease only after the guests are gone"
 
 mark_leftovers e2e-1-aaa
-guests
+guests "$(guest 100 running $((20 * GIB)) 4 home '')"
 expect_status "a leftovers Lease changed after the read" 1 env FAKE_K8S_BUMP_AFTER_GET=1 E2E_HOLDER=janitor "$e2e" lease release-stale
 [ -f "$work/k8s/lease.json" ] || fail "release-stale does not delete a Lease that changed after the read"
 ok "release-stale deletes only the Lease it read"
@@ -117,3 +119,9 @@ expect_status "release-stale on a valid Lease" 0 env E2E_HOLDER=janitor E2E_NOW=
 expect_status "release-stale on an expired Lease" 0 env E2E_HOLDER=janitor E2E_NOW=$((t0 + 7201)) "$e2e" lease release-stale
 [ ! -f "$work/k8s/lease.json" ] || fail "an expired Lease is deleted"
 ok "release-stale keeps a valid Lease and deletes an expired one"
+
+baseline
+fixture /access/permissions '{"data":{"/":{"VM.Audit":1}}}'
+expect_status "verify-clean with an audit token that cannot see every guest" 1 "$e2e" verify-clean e2e-1-aaa
+grep -q 'VM.Audit and Sys.Audit' <<<"$out" || fail "the message names the permissions" "$out"
+ok "the teardown check refuses an audit token that cannot see every guest"
