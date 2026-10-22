@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Stand-in for gh in the tests. It logs each call with the token and the body,
+# and answers "issue list" with $FAKE_GH/list.json.
+set -euo pipefail
+
+echo "token=${GH_TOKEN:-none} $*" >>"$FAKE_GH/calls.log"
+case "$1 $2" in
+  "issue list")
+    cat "$FAKE_GH/list.json"
+    ;;
+  "issue create" | "issue comment")
+    cat >>"$FAKE_GH/bodies.log"
+    ;;
+  *)
+    exit 2
+    ;;
+esac

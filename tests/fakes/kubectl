@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Stand-in for kubectl in the tests. It keeps one Lease in $FAKE_K8S/lease.json
+# and behaves like the API server: create fails when the Lease exists, replace
+# fails when resourceVersion is stale, and a delete with preconditions fails
+# when the uid or resourceVersion no longer match.
+#   FAKE_K8S_BUMP_AFTER_GET=1  another writer changes the Lease right after each get
+#   FAKE_K8S_DOWN=1            every call fails like an unreachable cluster
+#   a file replace-fail in $FAKE_K8S makes every replace fail with Conflict
+#   a file conflict-once in $FAKE_K8S makes the next replace fail with Conflict
+#   FAKE_TEARDOWN_FLAG=file    calls made while the file exists go to during-teardown.log
+#   FAKE_K8S_SLEEP=n           create takes n seconds
+#   FAKE_K8S_DELETE_FORBIDDEN=1  a delete fails with Forbidden
+# Every call is logged in $FAKE_K8S/calls.log.
+set -euo pipefail
+
+echo "$*" >>"$FAKE_K8S/calls.log"
+store="$FAKE_K8S/lease.json"
+if [ "${FAKE_K8S_DOWN:-0}" = 1 ]; then
+  echo "Unable to connect to the server: dial tcp: connection refused" >&2
+  exit 1
+fi
+if [ -n "${FAKE_TEARDOWN_FLAG:-}" ] && [ -e "$FAKE_TEARDOWN_FLAG" ]; then
+  echo "$*" >>"$FAKE_K8S/during-teardown.log"
+fi
+if [ "$1" = -n ]; then
+  shift 2
+fi
+verb="$1"
+case "$verb" in
+  get)
+    [ -f "$store" ] || {
+      echo "Error from server (NotFound): leases not found" >&2
+      exit 1
+    }
+    cat "$store"
+    if [ "${FAKE_K8S_BUMP_AFTER_GET:-0}" = 1 ]; then
+      jq '.metadata.resourceVersion = ((.metadata.resourceVersion | tonumber) + 1 | tostring)' "$store" >"$store.new"
+      mv "$store.new" "$store"
+    fi
+    ;;
+  create)
+    sleep "${FAKE_K8S_SLEEP:-0}"
+    [ ! -f "$store" ] || {
+      echo "Error from server (AlreadyExists)" >&2
+      exit 1
+    }
+    jq '.metadata.resourceVersion = "1" | .metadata.uid = "uid-1"' >"$store"
+    ;;
+  replace)
+    [ -f "$store" ] || exit 1
+    if [ -e "$FAKE_K8S/replace-fail" ]; then
+      echo "Error from server (Conflict)" >&2
+      exit 1
+    fi
+    if [ -e "$FAKE_K8S/conflict-once" ]; then
+      rm -f "$FAKE_K8S/conflict-once"
+      echo "Error from server (Conflict)" >&2
+      exit 1
+    fi
+    incoming="$(cat)"
+    current="$(jq -r '.metadata.resourceVersion' "$store")"
+    [ "$(jq -r '.metadata.resourceVersion // ""' <<<"$incoming")" = "$current" ] || {
+      echo "Error from server (Conflict)" >&2
+      exit 1
+    }
+    jq --arg v "$((current + 1))" --arg uid "$(jq -r '.metadata.uid' "$store")" \
+      '.metadata.resourceVersion = $v | .metadata.uid = $uid' <<<"$incoming" >"$store"
+    ;;
+  delete)
+    if [ "${FAKE_K8S_DELETE_FORBIDDEN:-0}" = 1 ]; then
+      echo "Error from server (Forbidden): leases is forbidden" >&2
+      exit 1
+    fi
+    if [ "${2:-}" = --raw ]; then
+      options="$(cat)"
+      [ -f "$store" ] || exit 1
+      [ "$(jq -r '.preconditions.resourceVersion // ""' <<<"$options")" = "$(jq -r '.metadata.resourceVersion' "$store")" ] || {
+        echo "Error from server (Conflict): the resourceVersion precondition failed" >&2
+        exit 1
+      }
+      want_uid="$(jq -r '.preconditions.uid // ""' <<<"$options")"
+      [ -z "$want_uid" ] || [ "$want_uid" = "$(jq -r '.metadata.uid' "$store")" ] || {
+        echo "Error from server (Conflict): the uid precondition failed" >&2
+        exit 1
+      }
+    fi
+    rm -f "$store"
+    ;;
+  *)
+    echo "fake kubectl: unsupported: $*" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Automerge: grouped patch PRs and minor PRs merge once the required commit check passes. The image and Actions pins are the only dependencies. Major updates are reviewed by hand.",
+  "extends": [
+    "local>bbaliyan/renovate-config"
+  ],
+  "enabledManagers": [
+    "github-actions",
+    "devcontainer"
+  ]
+}
